@@ -4,8 +4,11 @@ import numpy as np
 from io import StringIO
 import csv
 from nist_tests import NistTests
+from multiprocessing import Pool, cpu_count, get_context
+from batch_analysis import analyze_one, _init_worker
 from code_converter import CodeConverter
 import time
+from io import BytesIO
 
 st.set_page_config(page_title="NIST Statistical Tests", layout="wide")
 
@@ -40,6 +43,31 @@ st.sidebar.markdown("""
 9. Overlapping Patterns Test
 10. Overall Randomness Assessment
 """)
+
+# Performance settings
+st.sidebar.subheader("Performance")
+proc_default = max(1, cpu_count() // 2)
+processes = st.sidebar.number_input(
+    "Processes",
+    min_value=1,
+    max_value=max(1, cpu_count()),
+    value=proc_default,
+    help="Number of parallel worker processes"
+)
+chunksize = st.sidebar.number_input(
+    "Chunksize",
+    min_value=1,
+    max_value=10000,
+    value=500,
+    help="Work items per process chunk for scheduling"
+)
+limit = st.sidebar.number_input(
+    "Limit (optional)",
+    min_value=0,
+    max_value=10000000,
+    value=0,
+    help="Analyze only first N codes (0 = no limit)"
+)
 
 # Main content area
 if uploaded_file is not None:
@@ -79,28 +107,41 @@ if uploaded_file is not None:
         start_time = time.time()
         total_codes = len(codes)
         
-        # Process each code
-        for idx, code in enumerate(codes):
-            # Update progress
-            progress = (idx + 1) / total_codes
-            progress_bar.progress(progress)
-            status_text.text(f"Processing code {idx + 1:,} of {total_codes:,}...")
-            
-            # Convert code to binary
-            try:
-                binary_sequence = converter.code_to_binary(code)
-                
-                # Run NIST tests
-                results = nist_tests.run_all_tests(binary_sequence, code)
-                all_results.append(results)
-                
-            except Exception as e:
-                st.warning(f"Error processing code '{code}': {str(e)}")
-                continue
-            
-            # Update UI every 100 codes or for small datasets
-            if idx % 100 == 0 or total_codes < 1000:
-                pass  # Progress already updated above
+        # Apply optional limit
+        if limit and limit > 0:
+            codes = codes[:limit]
+            total_codes = len(codes)
+
+        # Parallel processing
+        processed = 0
+        update_every = max(1000, total_codes // 100) if total_codes > 1000 else 50
+        status_text.text(f"Spawning {processes} workers (chunksize={chunksize})...")
+        try:
+            if processes > 1:
+                # Use fork context on macOS for better behavior/perf in Streamlit
+                try:
+                    mp_ctx = get_context("fork")
+                except Exception:
+                    mp_ctx = None
+                PoolClass = mp_ctx.Pool if mp_ctx is not None else Pool
+                with PoolClass(processes=processes, initializer=_init_worker) as pool:
+                    for res in pool.imap_unordered(analyze_one, codes, chunksize=chunksize):
+                        all_results.append(res)
+                        processed += 1
+                        if processed % update_every == 0 or processed == total_codes:
+                            progress_bar.progress(processed / total_codes)
+                            status_text.text(f"Processed {processed:,} / {total_codes:,}")
+            else:
+                # Fallback sequential
+                for code in codes:
+                    res = analyze_one(code)
+                    all_results.append(res)
+                    processed += 1
+                    if processed % update_every == 0 or processed == total_codes:
+                        progress_bar.progress(processed / total_codes)
+                        status_text.text(f"Processed {processed:,} / {total_codes:,}")
+        except Exception as e:
+            st.error(f"Parallel processing error: {e}")
         
         elapsed_time = time.time() - start_time
         status_text.text(f"✅ Analysis complete! Processed {len(all_results):,} codes in {elapsed_time:.2f} seconds")
@@ -178,6 +219,67 @@ if uploaded_file is not None:
                 file_name=f"nist_test_results_{int(time.time())}.csv",
                 mime="text/csv"
             )
+
+            # PDF summary export
+            try:
+                from reportlab.lib.pagesizes import A4
+                from reportlab.pdfgen import canvas
+                from reportlab.lib.units import cm
+                from reportlab.lib import colors
+
+                def build_summary_pdf():
+                    buffer = BytesIO()
+                    c = canvas.Canvas(buffer, pagesize=A4)
+                    width, height = A4
+                    x_margin = 2*cm
+                    y = height - 2*cm
+
+                    def line(txt, size=12, color=colors.black):
+                        nonlocal y
+                        c.setFont("Helvetica", size)
+                        c.setFillColor(color)
+                        c.drawString(x_margin, y, txt)
+                        y -= 0.8*cm
+
+                    # Header
+                    line("NIST Statistical Tests - Summary", 16)
+                    line("")
+                    line(f"Total Codes Analyzed: {len(all_results):,}")
+                    line(f"Codes Passed All Tests: {int(passed_codes):,}")
+                    line(f"Overall Pass Rate: {pass_rate:.2f}%")
+                    if 'monobit_entropy' in df_results.columns:
+                        line(f"Avg Monobit Entropy: {df_results['monobit_entropy'].mean():.3f}")
+                    line("")
+                    line("Test-by-Test Results:", 14)
+
+                    # Table-like listing
+                    for row in test_summary:
+                        name = row['Test Name']
+                        passed = row['Passed']
+                        failed = row['Failed']
+                        pr = row['Pass Rate (%)']
+                        avgp = row.get('Avg p-value')
+                        avga = row.get('Avg>=α')
+                        line(f"- {name}: Passed {passed:,} / Failed {failed:,} (Rate {pr})")
+                        if avgp is not None:
+                            line(f"  Avg p-value: {avgp}  Avg>=α: {avga}", 10, colors.grey)
+                        if y < 3*cm:
+                            c.showPage(); y = height - 2*cm
+
+                    c.showPage()
+                    c.save()
+                    buffer.seek(0)
+                    return buffer.getvalue()
+
+                pdf_bytes = build_summary_pdf()
+                st.download_button(
+                    label="📄 Download Summary PDF",
+                    data=pdf_bytes,
+                    file_name=f"nist_summary_{int(time.time())}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.info("Install reportlab to enable PDF export: pip install reportlab")
             
             # Failed codes analysis
             failed_codes = df_results[~df_results['overall_passed']]
